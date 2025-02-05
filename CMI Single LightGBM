@@ -1,0 +1,1291 @@
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "id": "3684cbc9",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-02-05T14:13:39.923252Z",
+     "iopub.status.busy": "2025-02-05T14:13:39.922835Z",
+     "iopub.status.idle": "2025-02-05T14:13:43.685617Z",
+     "shell.execute_reply": "2025-02-05T14:13:43.684567Z"
+    },
+    "papermill": {
+     "duration": 3.775127,
+     "end_time": "2025-02-05T14:13:43.688310",
+     "exception": false,
+     "start_time": "2025-02-05T14:13:39.913183",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "import os\n",
+    "import random\n",
+    "from tqdm import tqdm\n",
+    "from pathlib import Path\n",
+    "from concurrent.futures import ThreadPoolExecutor\n",
+    "\n",
+    "import numpy as np\n",
+    "import pandas as pd\n",
+    "\n",
+    "from sklearn.metrics import make_scorer\n",
+    "from sklearn.metrics import cohen_kappa_score\n",
+    "from sklearn.model_selection import StratifiedKFold\n",
+    "from sklearn.model_selection import cross_val_score\n",
+    "from sklearn.model_selection import cross_val_predict\n",
+    "from sklearn.preprocessing import OrdinalEncoder\n",
+    "from sklearn.ensemble import VotingRegressor\n",
+    "from sklearn.impute import SimpleImputer\n",
+    "\n",
+    "from scipy.optimize import minimize\n",
+    "import optuna\n",
+    "\n",
+    "import lightgbm as lgb\n",
+    "\n",
+    "import warnings\n",
+    "warnings.filterwarnings('ignore')\n",
+    "\n",
+    "\n",
+    "SEED = 42\n",
+    "\n",
+    "KAPPA_SCORER = make_scorer(\n",
+    "    cohen_kappa_score, \n",
+    "    greater_is_better=True, \n",
+    "    weights='quadratic',\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "id": "69f8212e",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-02-05T14:13:43.704989Z",
+     "iopub.status.busy": "2025-02-05T14:13:43.704399Z",
+     "iopub.status.idle": "2025-02-05T14:13:43.713459Z",
+     "shell.execute_reply": "2025-02-05T14:13:43.712279Z"
+    },
+    "papermill": {
+     "duration": 0.019759,
+     "end_time": "2025-02-05T14:13:43.715538",
+     "exception": false,
+     "start_time": "2025-02-05T14:13:43.695779",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "def lgb_objective(trial):\n",
+    "    params = {\n",
+    "        'objective':         'l2',\n",
+    "        'verbosity':         -1,\n",
+    "        'n_iter':            200,\n",
+    "        'random_state':      SEED,\n",
+    "        'boosting_type':     'gbdt',\n",
+    "        'lambda_l1':         trial.suggest_float('lambda_l1', 1e-3, 10.0, log=True),\n",
+    "        'lambda_l2':         trial.suggest_float('lambda_l2', 1e-3, 10.0, log=True),\n",
+    "        'learning_rate':     trial.suggest_float('learning_rate', 1e-2, 1e-1, log=True),\n",
+    "        'max_depth':         trial.suggest_int('max_depth', 4, 8),\n",
+    "        'num_leaves':        trial.suggest_int('num_leaves', 16, 256),\n",
+    "        'colsample_bytree':  trial.suggest_float('colsample_bytree', 0.4, 1.0),\n",
+    "        'colsample_bynode':  trial.suggest_float('colsample_bynode', 0.4, 1.0),\n",
+    "        'bagging_fraction':  trial.suggest_float('bagging_fraction', 0.4, 1.0),\n",
+    "        'bagging_freq':      trial.suggest_int('bagging_freq', 1, 7),\n",
+    "        'min_data_in_leaf':  trial.suggest_int('min_data_in_leaf', 5, 100),\n",
+    "    }\n",
+    "    \n",
+    "    X = df_train[feature_cols]\n",
+    "    y = df_train[target_col]\n",
+    "    cv = StratifiedKFold(5, shuffle=True, random_state=SEED)\n",
+    "    estimator = CustomLGBMRegressor(**params)\n",
+    "\n",
+    "    val_scores = cross_val_score(\n",
+    "        estimator=estimator, \n",
+    "        X=X, y=y, \n",
+    "        cv=cv, \n",
+    "        scoring=KAPPA_SCORER,\n",
+    "    )\n",
+    "\n",
+    "    return np.mean(val_scores)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "id": "487c79f1",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-02-05T14:13:43.731605Z",
+     "iopub.status.busy": "2025-02-05T14:13:43.730559Z",
+     "iopub.status.idle": "2025-02-05T14:13:43.736675Z",
+     "shell.execute_reply": "2025-02-05T14:13:43.735628Z"
+    },
+    "papermill": {
+     "duration": 0.016468,
+     "end_time": "2025-02-05T14:13:43.738949",
+     "exception": false,
+     "start_time": "2025-02-05T14:13:43.722481",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "def process_file(filename, dirname):\n",
+    "    df = pd.read_parquet(os.path.join(dirname, filename, 'part-0.parquet'))\n",
+    "    df.drop('step', axis=1, inplace=True)\n",
+    "    \n",
+    "    return df.describe().values.reshape(-1), filename.split('=')[1]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "id": "be4e9749",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-02-05T14:13:43.754641Z",
+     "iopub.status.busy": "2025-02-05T14:13:43.754238Z",
+     "iopub.status.idle": "2025-02-05T14:13:43.760563Z",
+     "shell.execute_reply": "2025-02-05T14:13:43.759599Z"
+    },
+    "papermill": {
+     "duration": 0.016625,
+     "end_time": "2025-02-05T14:13:43.762581",
+     "exception": false,
+     "start_time": "2025-02-05T14:13:43.745956",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "def load_time_series(dirname):\n",
+    "    ids = os.listdir(dirname)\n",
+    "    \n",
+    "    with ThreadPoolExecutor() as executor:\n",
+    "        results = list(tqdm(executor.map(lambda fname: process_file(fname, dirname), ids), total=len(ids)))\n",
+    "    \n",
+    "    stats, indexes = zip(*results)\n",
+    "    df = pd.DataFrame(stats, columns=[f\"stat_{i}\" for i in range(len(stats[0]))])\n",
+    "    df['id'] = indexes\n",
+    "    \n",
+    "    return df"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "id": "e8bc75c4",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-02-05T14:13:43.778659Z",
+     "iopub.status.busy": "2025-02-05T14:13:43.778252Z",
+     "iopub.status.idle": "2025-02-05T14:13:43.783355Z",
+     "shell.execute_reply": "2025-02-05T14:13:43.782318Z"
+    },
+    "papermill": {
+     "duration": 0.015594,
+     "end_time": "2025-02-05T14:13:43.785529",
+     "exception": false,
+     "start_time": "2025-02-05T14:13:43.769935",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "def quadratic_weighted_kappa(estimator, X, y_true):\n",
+    "    y_pred = estimator.predict(X).round()\n",
+    "    return cohen_kappa_score(y_true, y_pred, weights='quadratic')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "id": "7dd4e131",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-02-05T14:13:43.801233Z",
+     "iopub.status.busy": "2025-02-05T14:13:43.800477Z",
+     "iopub.status.idle": "2025-02-05T14:13:43.805899Z",
+     "shell.execute_reply": "2025-02-05T14:13:43.804784Z"
+    },
+    "papermill": {
+     "duration": 0.015757,
+     "end_time": "2025-02-05T14:13:43.808153",
+     "exception": false,
+     "start_time": "2025-02-05T14:13:43.792396",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "def threshold_rounder(y_pred, thresholds):\n",
+    "    return np.where(y_pred < thresholds[0], 0,\n",
+    "                    np.where(y_pred < thresholds[1], 1,\n",
+    "                             np.where(y_pred < thresholds[2], 2, 3)))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "id": "6083b404",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-02-05T14:13:43.823531Z",
+     "iopub.status.busy": "2025-02-05T14:13:43.823117Z",
+     "iopub.status.idle": "2025-02-05T14:13:43.828199Z",
+     "shell.execute_reply": "2025-02-05T14:13:43.827165Z"
+    },
+    "jupyter": {
+     "source_hidden": true
+    },
+    "papermill": {
+     "duration": 0.015342,
+     "end_time": "2025-02-05T14:13:43.830333",
+     "exception": false,
+     "start_time": "2025-02-05T14:13:43.814991",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "def eval_preds(thresholds, y_true, y_pred):\n",
+    "    y_pred = threshold_rounder(y_pred, thresholds)\n",
+    "    score = cohen_kappa_score(y_true, y_pred, weights='quadratic')\n",
+    "    return -score"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "id": "ffbea717",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-02-05T14:13:43.846064Z",
+     "iopub.status.busy": "2025-02-05T14:13:43.845275Z",
+     "iopub.status.idle": "2025-02-05T14:13:43.852587Z",
+     "shell.execute_reply": "2025-02-05T14:13:43.851369Z"
+    },
+    "papermill": {
+     "duration": 0.017298,
+     "end_time": "2025-02-05T14:13:43.854609",
+     "exception": false,
+     "start_time": "2025-02-05T14:13:43.837311",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "class CustomLGBMRegressor(lgb.LGBMRegressor):\n",
+    "    '''\n",
+    "    Custom LightGBM Regressor\n",
+    "    \n",
+    "    It optimizes threshold values during fitting.\n",
+    "    Main goal is preventing overfit on validation data.\n",
+    "    '''\n",
+    "    def fit(self, X, y, **kwargs):\n",
+    "        super().fit(X, y, **kwargs)\n",
+    "        y_pred = super().predict(X, **kwargs)\n",
+    "        \n",
+    "        self.optimizer = minimize(\n",
+    "            eval_preds, \n",
+    "            x0=[0.5, 1.5, 2.5], \n",
+    "            args=(y, y_pred), \n",
+    "            method='Nelder-Mead',\n",
+    "        )\n",
+    "        \n",
+    "    def predict(self, X, **kwargs):\n",
+    "        y_pred = super().predict(X, **kwargs)\n",
+    "        y_pred = threshold_rounder(y_pred, self.optimizer.x)\n",
+    "        return y_pred"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 9,
+   "id": "d4f60ddc",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-02-05T14:13:43.869864Z",
+     "iopub.status.busy": "2025-02-05T14:13:43.869452Z",
+     "iopub.status.idle": "2025-02-05T14:13:43.874243Z",
+     "shell.execute_reply": "2025-02-05T14:13:43.873094Z"
+    },
+    "papermill": {
+     "duration": 0.014925,
+     "end_time": "2025-02-05T14:13:43.876358",
+     "exception": false,
+     "start_time": "2025-02-05T14:13:43.861433",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "root = Path('/kaggle/input/child-mind-institute-problematic-internet-use')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "5517b2e5",
+   "metadata": {
+    "papermill": {
+     "duration": 0.006436,
+     "end_time": "2025-02-05T14:13:43.889552",
+     "exception": false,
+     "start_time": "2025-02-05T14:13:43.883116",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "### Tabular Data"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 10,
+   "id": "ddc085b0",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-02-05T14:13:43.904503Z",
+     "iopub.status.busy": "2025-02-05T14:13:43.904138Z",
+     "iopub.status.idle": "2025-02-05T14:13:44.001943Z",
+     "shell.execute_reply": "2025-02-05T14:13:44.000531Z"
+    },
+    "papermill": {
+     "duration": 0.108039,
+     "end_time": "2025-02-05T14:13:44.004358",
+     "exception": false,
+     "start_time": "2025-02-05T14:13:43.896319",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "df_train = pd.read_csv(root / 'train.csv')\n",
+    "df_test = pd.read_csv(root / 'test.csv')\n",
+    "df_subm = pd.read_csv(root / 'sample_submission.csv', index_col='id')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "1f73280d",
+   "metadata": {
+    "papermill": {
+     "duration": 0.006991,
+     "end_time": "2025-02-05T14:13:44.018361",
+     "exception": false,
+     "start_time": "2025-02-05T14:13:44.011370",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "### Time Series Data"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 11,
+   "id": "917ef6a6",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-02-05T14:13:44.034381Z",
+     "iopub.status.busy": "2025-02-05T14:13:44.033340Z",
+     "iopub.status.idle": "2025-02-05T14:15:10.043433Z",
+     "shell.execute_reply": "2025-02-05T14:15:10.042053Z"
+    },
+    "papermill": {
+     "duration": 86.020727,
+     "end_time": "2025-02-05T14:15:10.045954",
+     "exception": false,
+     "start_time": "2025-02-05T14:13:44.025227",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 996/996 [01:25<00:00, 11.64it/s]\n",
+      "100%|██████████| 2/2 [00:00<00:00,  5.98it/s]\n"
+     ]
+    }
+   ],
+   "source": [
+    "ts_train = load_time_series(root / \"series_train.parquet\")\n",
+    "ts_test = load_time_series(root / \"series_test.parquet\")\n",
+    "\n",
+    "time_series_cols = ts_train.columns.tolist()\n",
+    "time_series_cols.remove(\"id\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 12,
+   "id": "b60e6a8d",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-02-05T14:15:10.099697Z",
+     "iopub.status.busy": "2025-02-05T14:15:10.098789Z",
+     "iopub.status.idle": "2025-02-05T14:15:10.106994Z",
+     "shell.execute_reply": "2025-02-05T14:15:10.105862Z"
+    },
+    "papermill": {
+     "duration": 0.037068,
+     "end_time": "2025-02-05T14:15:10.109062",
+     "exception": false,
+     "start_time": "2025-02-05T14:15:10.071994",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "996"
+      ]
+     },
+     "execution_count": 12,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "len(ts_train)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "4d2f9480",
+   "metadata": {
+    "papermill": {
+     "duration": 0.024607,
+     "end_time": "2025-02-05T14:15:10.159090",
+     "exception": false,
+     "start_time": "2025-02-05T14:15:10.134483",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "### Merge Operation"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 13,
+   "id": "2e8385e0",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-02-05T14:15:10.210054Z",
+     "iopub.status.busy": "2025-02-05T14:15:10.209648Z",
+     "iopub.status.idle": "2025-02-05T14:15:10.271003Z",
+     "shell.execute_reply": "2025-02-05T14:15:10.269860Z"
+    },
+    "papermill": {
+     "duration": 0.089986,
+     "end_time": "2025-02-05T14:15:10.273764",
+     "exception": false,
+     "start_time": "2025-02-05T14:15:10.183778",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "df_train = pd.merge(df_train, ts_train, how=\"left\", on='id')\n",
+    "df_test = pd.merge(df_test, ts_test, how=\"left\", on='id')\n",
+    "\n",
+    "df_train = df_train.set_index('id')\n",
+    "df_test = df_test.set_index('id')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "5c4b2c5b",
+   "metadata": {
+    "papermill": {
+     "duration": 0.030351,
+     "end_time": "2025-02-05T14:15:10.334351",
+     "exception": false,
+     "start_time": "2025-02-05T14:15:10.304000",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "### Global Variables"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 14,
+   "id": "c49f9c57",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-02-05T14:15:10.396706Z",
+     "iopub.status.busy": "2025-02-05T14:15:10.396237Z",
+     "iopub.status.idle": "2025-02-05T14:15:10.404952Z",
+     "shell.execute_reply": "2025-02-05T14:15:10.403838Z"
+    },
+    "papermill": {
+     "duration": 0.043157,
+     "end_time": "2025-02-05T14:15:10.407360",
+     "exception": false,
+     "start_time": "2025-02-05T14:15:10.364203",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "cat_cols = ['Basic_Demos-Enroll_Season', 'CGAS-Season', 'Physical-Season', 'Fitness_Endurance-Season', 'FGC-Season', 'BIA-Season', 'PAQ_A-Season', 'PAQ_C-Season', 'SDS-Season', 'PreInt_EduHx-Season']\n",
+    "num_cols = ['Basic_Demos-Age', 'Basic_Demos-Sex', 'CGAS-CGAS_Score', 'Physical-BMI', 'Physical-Height', 'Physical-Weight', 'Physical-Waist_Circumference', 'Physical-Diastolic_BP', 'Physical-HeartRate', 'Physical-Systolic_BP', 'Fitness_Endurance-Max_Stage', 'Fitness_Endurance-Time_Mins', 'Fitness_Endurance-Time_Sec', 'FGC-FGC_CU', 'FGC-FGC_CU_Zone', 'FGC-FGC_GSND', 'FGC-FGC_GSND_Zone', 'FGC-FGC_GSD', 'FGC-FGC_GSD_Zone', 'FGC-FGC_PU', 'FGC-FGC_PU_Zone', 'FGC-FGC_SRL', 'FGC-FGC_SRL_Zone', 'FGC-FGC_SRR', 'FGC-FGC_SRR_Zone', 'FGC-FGC_TL', 'FGC-FGC_TL_Zone', 'BIA-BIA_Activity_Level_num', 'BIA-BIA_BMC', 'BIA-BIA_BMR', 'BIA-BIA_DEE', 'BIA-BIA_ECW', 'BIA-BIA_FFM', 'BIA-BIA_FFMI', 'BIA-BIA_FMI', 'BIA-BIA_Fat', 'BIA-BIA_Frame_num', 'BIA-BIA_ICW', 'BIA-BIA_LDM', 'BIA-BIA_LST', 'BIA-BIA_SMM', 'BIA-BIA_TBW', 'PAQ_A-PAQ_A_Total', 'PAQ_C-PAQ_C_Total', 'SDS-SDS_Total_Raw', 'SDS-SDS_Total_T', 'PreInt_EduHx-computerinternet_hoursday']\n",
+    "tabular_cols = ['Basic_Demos-Enroll_Season', 'Basic_Demos-Sex', 'CGAS-Season', 'CGAS-CGAS_Score', 'Physical-Season', 'Physical-BMI',  'Physical-Waist_Circumference', 'Physical-Diastolic_BP', 'Physical-HeartRate', 'Physical-Systolic_BP', 'Fitness_Endurance-Season', 'Fitness_Endurance-Max_Stage', 'Fitness_Endurance-Time_Mins', 'Fitness_Endurance-Time_Sec', 'FGC-Season', 'FGC-FGC_CU', 'FGC-FGC_CU_Zone', 'FGC-FGC_GSND', 'FGC-FGC_GSND_Zone', 'FGC-FGC_GSD', 'FGC-FGC_GSD_Zone', 'FGC-FGC_PU', 'FGC-FGC_PU_Zone', 'FGC-FGC_SRL', 'FGC-FGC_SRL_Zone', 'FGC-FGC_SRR', 'FGC-FGC_SRR_Zone', 'FGC-FGC_TL', 'FGC-FGC_TL_Zone', 'BIA-Season', 'BIA-BIA_Activity_Level_num', 'BIA-BIA_BMC', 'BIA-BIA_BMI', 'BIA-BIA_BMR', 'BIA-BIA_DEE', 'BIA-BIA_ECW', 'BIA-BIA_FFM', 'BIA-BIA_FFMI', 'BIA-BIA_FMI', 'BIA-BIA_Fat', 'BIA-BIA_Frame_num', 'BIA-BIA_ICW', 'BIA-BIA_LDM', 'BIA-BIA_LST', 'BIA-BIA_SMM', 'BIA-BIA_TBW', 'PAQ_A-Season', 'PAQ_A-PAQ_A_Total', 'PAQ_C-Season', 'PAQ_C-PAQ_C_Total', 'SDS-Season', 'SDS-SDS_Total_Raw', 'SDS-SDS_Total_T', 'PreInt_EduHx-Season', 'PreInt_EduHx-computerinternet_hoursday']\n",
+    "target_col = 'sii'\n",
+    "\n",
+    "feature_cols = tabular_cols + time_series_cols\n",
+    "num_cols = num_cols + time_series_cols"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "19d55bc2",
+   "metadata": {
+    "papermill": {
+     "duration": 0.029673,
+     "end_time": "2025-02-05T14:15:10.467096",
+     "exception": false,
+     "start_time": "2025-02-05T14:15:10.437423",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "### Drop Rows with Missing Targets"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 15,
+   "id": "67553bca",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-02-05T14:15:10.535811Z",
+     "iopub.status.busy": "2025-02-05T14:15:10.532201Z",
+     "iopub.status.idle": "2025-02-05T14:15:10.549373Z",
+     "shell.execute_reply": "2025-02-05T14:15:10.548097Z"
+    },
+    "papermill": {
+     "duration": 0.055575,
+     "end_time": "2025-02-05T14:15:10.552179",
+     "exception": false,
+     "start_time": "2025-02-05T14:15:10.496604",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "df_train = df_train.dropna(subset=[target_col])"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "7dd85cd8",
+   "metadata": {
+    "papermill": {
+     "duration": 0.02989,
+     "end_time": "2025-02-05T14:15:10.654138",
+     "exception": false,
+     "start_time": "2025-02-05T14:15:10.624248",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "### Numeric Value Imputing"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 16,
+   "id": "775f6642",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-02-05T14:15:10.720044Z",
+     "iopub.status.busy": "2025-02-05T14:15:10.719630Z",
+     "iopub.status.idle": "2025-02-05T14:15:10.776499Z",
+     "shell.execute_reply": "2025-02-05T14:15:10.775427Z"
+    },
+    "papermill": {
+     "duration": 0.092634,
+     "end_time": "2025-02-05T14:15:10.779300",
+     "exception": false,
+     "start_time": "2025-02-05T14:15:10.686666",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "imputer = SimpleImputer(\n",
+    "    strategy='mean',\n",
+    ")\n",
+    "\n",
+    "df_train[num_cols] = imputer.fit_transform(df_train[num_cols])\n",
+    "df_test[num_cols] = imputer.transform(df_test[num_cols])"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "02b2d77c",
+   "metadata": {
+    "papermill": {
+     "duration": 0.029869,
+     "end_time": "2025-02-05T14:15:10.839364",
+     "exception": false,
+     "start_time": "2025-02-05T14:15:10.809495",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "### Category Encoding"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 17,
+   "id": "6cf5ced3",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-02-05T14:15:10.899230Z",
+     "iopub.status.busy": "2025-02-05T14:15:10.898778Z",
+     "iopub.status.idle": "2025-02-05T14:15:10.937085Z",
+     "shell.execute_reply": "2025-02-05T14:15:10.936018Z"
+    },
+    "papermill": {
+     "duration": 0.071112,
+     "end_time": "2025-02-05T14:15:10.939729",
+     "exception": false,
+     "start_time": "2025-02-05T14:15:10.868617",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "encoder = OrdinalEncoder(\n",
+    "    dtype=np.int32,\n",
+    "    handle_unknown='use_encoded_value',\n",
+    "    unknown_value=-1,\n",
+    "    encoded_missing_value=-2,\n",
+    ")\n",
+    "\n",
+    "df_train[cat_cols] = encoder.fit_transform(df_train[cat_cols])\n",
+    "df_train[cat_cols] = df_train[cat_cols].astype('category')\n",
+    "\n",
+    "df_test[cat_cols] = encoder.transform(df_test[cat_cols])\n",
+    "df_test[cat_cols] = df_test[cat_cols].astype('category')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "6db4c5bb",
+   "metadata": {
+    "papermill": {
+     "duration": 0.028968,
+     "end_time": "2025-02-05T14:15:10.998212",
+     "exception": false,
+     "start_time": "2025-02-05T14:15:10.969244",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "### Optuna - Hyperparameter Tuning"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 18,
+   "id": "33f7551d",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-02-05T14:15:11.059927Z",
+     "iopub.status.busy": "2025-02-05T14:15:11.059531Z",
+     "iopub.status.idle": "2025-02-05T14:15:11.064139Z",
+     "shell.execute_reply": "2025-02-05T14:15:11.063044Z"
+    },
+    "papermill": {
+     "duration": 0.037903,
+     "end_time": "2025-02-05T14:15:11.066682",
+     "exception": false,
+     "start_time": "2025-02-05T14:15:11.028779",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "# study = optuna.create_study(direction='maximize', study_name='Regressor')\n",
+    "# study.optimize(lgb_objective, n_trials=30, show_progress_bar=True)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "5abfa70a",
+   "metadata": {
+    "papermill": {
+     "duration": 0.029306,
+     "end_time": "2025-02-05T14:15:11.125378",
+     "exception": false,
+     "start_time": "2025-02-05T14:15:11.096072",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "### Tuned Hyperparameters"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 19,
+   "id": "6c5c815b",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-02-05T14:15:11.247447Z",
+     "iopub.status.busy": "2025-02-05T14:15:11.246412Z",
+     "iopub.status.idle": "2025-02-05T14:15:11.252754Z",
+     "shell.execute_reply": "2025-02-05T14:15:11.251713Z"
+    },
+    "papermill": {
+     "duration": 0.03935,
+     "end_time": "2025-02-05T14:15:11.255236",
+     "exception": false,
+     "start_time": "2025-02-05T14:15:11.215886",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "params = {\n",
+    "    'objective'       : 'l2',\n",
+    "    'verbosity'       : -1,\n",
+    "    'n_iter'          : 200,\n",
+    "    'lambda_l1'       : 0.005116829730239727,\n",
+    "    'lambda_l2'       : 0.0011520776712645852,\n",
+    "    'learning_rate'   : 0.02376367323636638,\n",
+    "    'max_depth'       : 5,\n",
+    "    'num_leaves'      : 207,\n",
+    "    'colsample_bytree': 0.7759862336963801,\n",
+    "    'colsample_bynode': 0.5110355095943208,\n",
+    "    'bagging_fraction': 0.5485770314992224,\n",
+    "    'bagging_freq'    : 7,\n",
+    "    'min_data_in_leaf': 78,\n",
+    "}\n",
+    "\n",
+    "model = CustomLGBMRegressor(**params, random_state=SEED)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "d80627b1",
+   "metadata": {
+    "papermill": {
+     "duration": 0.029567,
+     "end_time": "2025-02-05T14:15:11.321868",
+     "exception": false,
+     "start_time": "2025-02-05T14:15:11.292301",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "### Cross Validation"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 20,
+   "id": "ec75a598",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-02-05T14:15:11.383375Z",
+     "iopub.status.busy": "2025-02-05T14:15:11.382970Z",
+     "iopub.status.idle": "2025-02-05T14:15:11.389182Z",
+     "shell.execute_reply": "2025-02-05T14:15:11.388076Z"
+    },
+    "papermill": {
+     "duration": 0.039687,
+     "end_time": "2025-02-05T14:15:11.391554",
+     "exception": false,
+     "start_time": "2025-02-05T14:15:11.351867",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "df_train['Physical-BMI'] = df_train['Physical-BMI'] /df_train['BIA-BIA_BMI'] "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 21,
+   "id": "4e560525",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-02-05T14:15:11.452980Z",
+     "iopub.status.busy": "2025-02-05T14:15:11.452578Z",
+     "iopub.status.idle": "2025-02-05T14:15:11.478101Z",
+     "shell.execute_reply": "2025-02-05T14:15:11.476989Z"
+    },
+    "papermill": {
+     "duration": 0.059201,
+     "end_time": "2025-02-05T14:15:11.480862",
+     "exception": false,
+     "start_time": "2025-02-05T14:15:11.421661",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "import pandas as pd\n",
+    "from sklearn.decomposition import PCA\n",
+    "data = df_train[['Physical-Weight', 'Physical-Height', 'Basic_Demos-Age']].values\n",
+    "pca = PCA(n_components=1)\n",
+    "df_train['PCA_Physical'] = pca.fit_transform(data)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 22,
+   "id": "efc9e9e5",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-02-05T14:15:11.543036Z",
+     "iopub.status.busy": "2025-02-05T14:15:11.542658Z",
+     "iopub.status.idle": "2025-02-05T14:15:16.900375Z",
+     "shell.execute_reply": "2025-02-05T14:15:16.898341Z"
+    },
+    "papermill": {
+     "duration": 5.396965,
+     "end_time": "2025-02-05T14:15:16.908552",
+     "exception": false,
+     "start_time": "2025-02-05T14:15:11.511587",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "kappa score: 0.4221\n"
+     ]
+    }
+   ],
+   "source": [
+    "X = df_train[feature_cols]\n",
+    "y = df_train[target_col]\n",
+    "cv = StratifiedKFold(5, shuffle=True, random_state=SEED)\n",
+    "\n",
+    "val_scores = cross_val_score(\n",
+    "    model, X, y, cv=cv, \n",
+    "    scoring=KAPPA_SCORER,\n",
+    ")\n",
+    "\n",
+    "print(f'kappa score: {np.mean(val_scores):.4f}')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "3050ae76",
+   "metadata": {
+    "papermill": {
+     "duration": 0.048073,
+     "end_time": "2025-02-05T14:15:16.990184",
+     "exception": false,
+     "start_time": "2025-02-05T14:15:16.942111",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "### Seed Ensembling"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 23,
+   "id": "db69afc8",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-02-05T14:15:17.054750Z",
+     "iopub.status.busy": "2025-02-05T14:15:17.054288Z",
+     "iopub.status.idle": "2025-02-05T14:15:17.066143Z",
+     "shell.execute_reply": "2025-02-05T14:15:17.065028Z"
+    },
+    "papermill": {
+     "duration": 0.045137,
+     "end_time": "2025-02-05T14:15:17.068986",
+     "exception": false,
+     "start_time": "2025-02-05T14:15:17.023849",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "model = VotingRegressor([\n",
+    "    ('lgb_0', CustomLGBMRegressor(**params, random_state=12)),\n",
+    "    ('lgb_1', CustomLGBMRegressor(**params, random_state=22)),\n",
+    "    ('lgb_2', CustomLGBMRegressor(**params, random_state=32)),\n",
+    "    ('lgb_3', CustomLGBMRegressor(**params, random_state=42)),\n",
+    "    ('lgb_4', CustomLGBMRegressor(**params, random_state=52)),\n",
+    "    ('lgb_5', CustomLGBMRegressor(**params, random_state=62)),\n",
+    "    ('lgb_6', CustomLGBMRegressor(**params, random_state=72)),\n",
+    "    ('lgb_7', CustomLGBMRegressor(**params, random_state=82)),\n",
+    "    ('lgb_8', CustomLGBMRegressor(**params, random_state=92)),\n",
+    "    ('lgb_9', CustomLGBMRegressor(**params, random_state=102)),\n",
+    "])"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "b0fca18c",
+   "metadata": {
+    "papermill": {
+     "duration": 0.028464,
+     "end_time": "2025-02-05T14:15:17.126451",
+     "exception": false,
+     "start_time": "2025-02-05T14:15:17.097987",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "### Training"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 24,
+   "id": "6c62fbee",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-02-05T14:15:17.187834Z",
+     "iopub.status.busy": "2025-02-05T14:15:17.186720Z",
+     "iopub.status.idle": "2025-02-05T14:15:29.039002Z",
+     "shell.execute_reply": "2025-02-05T14:15:29.037899Z"
+    },
+    "papermill": {
+     "duration": 11.886435,
+     "end_time": "2025-02-05T14:15:29.041676",
+     "exception": false,
+     "start_time": "2025-02-05T14:15:17.155241",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<style>#sk-container-id-1 {color: black;background-color: white;}#sk-container-id-1 pre{padding: 0;}#sk-container-id-1 div.sk-toggleable {background-color: white;}#sk-container-id-1 label.sk-toggleable__label {cursor: pointer;display: block;width: 100%;margin-bottom: 0;padding: 0.3em;box-sizing: border-box;text-align: center;}#sk-container-id-1 label.sk-toggleable__label-arrow:before {content: \"▸\";float: left;margin-right: 0.25em;color: #696969;}#sk-container-id-1 label.sk-toggleable__label-arrow:hover:before {color: black;}#sk-container-id-1 div.sk-estimator:hover label.sk-toggleable__label-arrow:before {color: black;}#sk-container-id-1 div.sk-toggleable__content {max-height: 0;max-width: 0;overflow: hidden;text-align: left;background-color: #f0f8ff;}#sk-container-id-1 div.sk-toggleable__content pre {margin: 0.2em;color: black;border-radius: 0.25em;background-color: #f0f8ff;}#sk-container-id-1 input.sk-toggleable__control:checked~div.sk-toggleable__content {max-height: 200px;max-width: 100%;overflow: auto;}#sk-container-id-1 input.sk-toggleable__control:checked~label.sk-toggleable__label-arrow:before {content: \"▾\";}#sk-container-id-1 div.sk-estimator input.sk-toggleable__control:checked~label.sk-toggleable__label {background-color: #d4ebff;}#sk-container-id-1 div.sk-label input.sk-toggleable__control:checked~label.sk-toggleable__label {background-color: #d4ebff;}#sk-container-id-1 input.sk-hidden--visually {border: 0;clip: rect(1px 1px 1px 1px);clip: rect(1px, 1px, 1px, 1px);height: 1px;margin: -1px;overflow: hidden;padding: 0;position: absolute;width: 1px;}#sk-container-id-1 div.sk-estimator {font-family: monospace;background-color: #f0f8ff;border: 1px dotted black;border-radius: 0.25em;box-sizing: border-box;margin-bottom: 0.5em;}#sk-container-id-1 div.sk-estimator:hover {background-color: #d4ebff;}#sk-container-id-1 div.sk-parallel-item::after {content: \"\";width: 100%;border-bottom: 1px solid gray;flex-grow: 1;}#sk-container-id-1 div.sk-label:hover label.sk-toggleable__label {background-color: #d4ebff;}#sk-container-id-1 div.sk-serial::before {content: \"\";position: absolute;border-left: 1px solid gray;box-sizing: border-box;top: 0;bottom: 0;left: 50%;z-index: 0;}#sk-container-id-1 div.sk-serial {display: flex;flex-direction: column;align-items: center;background-color: white;padding-right: 0.2em;padding-left: 0.2em;position: relative;}#sk-container-id-1 div.sk-item {position: relative;z-index: 1;}#sk-container-id-1 div.sk-parallel {display: flex;align-items: stretch;justify-content: center;background-color: white;position: relative;}#sk-container-id-1 div.sk-item::before, #sk-container-id-1 div.sk-parallel-item::before {content: \"\";position: absolute;border-left: 1px solid gray;box-sizing: border-box;top: 0;bottom: 0;left: 50%;z-index: -1;}#sk-container-id-1 div.sk-parallel-item {display: flex;flex-direction: column;z-index: 1;position: relative;background-color: white;}#sk-container-id-1 div.sk-parallel-item:first-child::after {align-self: flex-end;width: 50%;}#sk-container-id-1 div.sk-parallel-item:last-child::after {align-self: flex-start;width: 50%;}#sk-container-id-1 div.sk-parallel-item:only-child::after {width: 0;}#sk-container-id-1 div.sk-dashed-wrapped {border: 1px dashed gray;margin: 0 0.4em 0.5em 0.4em;box-sizing: border-box;padding-bottom: 0.4em;background-color: white;}#sk-container-id-1 div.sk-label label {font-family: monospace;font-weight: bold;display: inline-block;line-height: 1.2em;}#sk-container-id-1 div.sk-label-container {text-align: center;}#sk-container-id-1 div.sk-container {/* jupyter's `normalize.less` sets `[hidden] { display: none; }` but bootstrap.min.css set `[hidden] { display: none !important; }` so we also need the `!important` here to be able to override the default hidden behavior on the sphinx rendered scikit-learn.org. See: https://github.com/scikit-learn/scikit-learn/issues/21755 */display: inline-block !important;position: relative;}#sk-container-id-1 div.sk-text-repr-fallback {display: none;}</style><div id=\"sk-container-id-1\" class=\"sk-top-container\"><div class=\"sk-text-repr-fallback\"><pre>VotingRegressor(estimators=[(&#x27;lgb_0&#x27;,\n",
+       "                             CustomLGBMRegressor(bagging_fraction=0.5485770314992224,\n",
+       "                                                 bagging_freq=7,\n",
+       "                                                 colsample_bynode=0.5110355095943208,\n",
+       "                                                 colsample_bytree=0.7759862336963801,\n",
+       "                                                 lambda_l1=0.005116829730239727,\n",
+       "                                                 lambda_l2=0.0011520776712645852,\n",
+       "                                                 learning_rate=0.02376367323636638,\n",
+       "                                                 max_depth=5,\n",
+       "                                                 min_data_in_leaf=78,\n",
+       "                                                 n_iter=200, num_leaves=207,\n",
+       "                                                 objective=&#x27;l2&#x27;,...\n",
+       "                            (&#x27;lgb_9&#x27;,\n",
+       "                             CustomLGBMRegressor(bagging_fraction=0.5485770314992224,\n",
+       "                                                 bagging_freq=7,\n",
+       "                                                 colsample_bynode=0.5110355095943208,\n",
+       "                                                 colsample_bytree=0.7759862336963801,\n",
+       "                                                 lambda_l1=0.005116829730239727,\n",
+       "                                                 lambda_l2=0.0011520776712645852,\n",
+       "                                                 learning_rate=0.02376367323636638,\n",
+       "                                                 max_depth=5,\n",
+       "                                                 min_data_in_leaf=78,\n",
+       "                                                 n_iter=200, num_leaves=207,\n",
+       "                                                 objective=&#x27;l2&#x27;,\n",
+       "                                                 random_state=102,\n",
+       "                                                 verbosity=-1))])</pre><b>In a Jupyter environment, please rerun this cell to show the HTML representation or trust the notebook. <br />On GitHub, the HTML representation is unable to render, please try loading this page with nbviewer.org.</b></div><div class=\"sk-container\" hidden><div class=\"sk-item sk-dashed-wrapped\"><div class=\"sk-label-container\"><div class=\"sk-label sk-toggleable\"><input class=\"sk-toggleable__control sk-hidden--visually\" id=\"sk-estimator-id-1\" type=\"checkbox\" ><label for=\"sk-estimator-id-1\" class=\"sk-toggleable__label sk-toggleable__label-arrow\">VotingRegressor</label><div class=\"sk-toggleable__content\"><pre>VotingRegressor(estimators=[(&#x27;lgb_0&#x27;,\n",
+       "                             CustomLGBMRegressor(bagging_fraction=0.5485770314992224,\n",
+       "                                                 bagging_freq=7,\n",
+       "                                                 colsample_bynode=0.5110355095943208,\n",
+       "                                                 colsample_bytree=0.7759862336963801,\n",
+       "                                                 lambda_l1=0.005116829730239727,\n",
+       "                                                 lambda_l2=0.0011520776712645852,\n",
+       "                                                 learning_rate=0.02376367323636638,\n",
+       "                                                 max_depth=5,\n",
+       "                                                 min_data_in_leaf=78,\n",
+       "                                                 n_iter=200, num_leaves=207,\n",
+       "                                                 objective=&#x27;l2&#x27;,...\n",
+       "                            (&#x27;lgb_9&#x27;,\n",
+       "                             CustomLGBMRegressor(bagging_fraction=0.5485770314992224,\n",
+       "                                                 bagging_freq=7,\n",
+       "                                                 colsample_bynode=0.5110355095943208,\n",
+       "                                                 colsample_bytree=0.7759862336963801,\n",
+       "                                                 lambda_l1=0.005116829730239727,\n",
+       "                                                 lambda_l2=0.0011520776712645852,\n",
+       "                                                 learning_rate=0.02376367323636638,\n",
+       "                                                 max_depth=5,\n",
+       "                                                 min_data_in_leaf=78,\n",
+       "                                                 n_iter=200, num_leaves=207,\n",
+       "                                                 objective=&#x27;l2&#x27;,\n",
+       "                                                 random_state=102,\n",
+       "                                                 verbosity=-1))])</pre></div></div></div><div class=\"sk-parallel\"><div class=\"sk-parallel-item\"><div class=\"sk-item\"><div class=\"sk-label-container\"><div class=\"sk-label sk-toggleable\"><label>lgb_0</label></div></div><div class=\"sk-serial\"><div class=\"sk-item\"><div class=\"sk-estimator sk-toggleable\"><input class=\"sk-toggleable__control sk-hidden--visually\" id=\"sk-estimator-id-2\" type=\"checkbox\" ><label for=\"sk-estimator-id-2\" class=\"sk-toggleable__label sk-toggleable__label-arrow\">CustomLGBMRegressor</label><div class=\"sk-toggleable__content\"><pre>CustomLGBMRegressor(bagging_fraction=0.5485770314992224, bagging_freq=7,\n",
+       "                    colsample_bynode=0.5110355095943208,\n",
+       "                    colsample_bytree=0.7759862336963801,\n",
+       "                    lambda_l1=0.005116829730239727,\n",
+       "                    lambda_l2=0.0011520776712645852,\n",
+       "                    learning_rate=0.02376367323636638, max_depth=5,\n",
+       "                    min_data_in_leaf=78, n_iter=200, num_leaves=207,\n",
+       "                    objective=&#x27;l2&#x27;, random_state=12, verbosity=-1)</pre></div></div></div></div></div></div><div class=\"sk-parallel-item\"><div class=\"sk-item\"><div class=\"sk-label-container\"><div class=\"sk-label sk-toggleable\"><label>lgb_1</label></div></div><div class=\"sk-serial\"><div class=\"sk-item\"><div class=\"sk-estimator sk-toggleable\"><input class=\"sk-toggleable__control sk-hidden--visually\" id=\"sk-estimator-id-3\" type=\"checkbox\" ><label for=\"sk-estimator-id-3\" class=\"sk-toggleable__label sk-toggleable__label-arrow\">CustomLGBMRegressor</label><div class=\"sk-toggleable__content\"><pre>CustomLGBMRegressor(bagging_fraction=0.5485770314992224, bagging_freq=7,\n",
+       "                    colsample_bynode=0.5110355095943208,\n",
+       "                    colsample_bytree=0.7759862336963801,\n",
+       "                    lambda_l1=0.005116829730239727,\n",
+       "                    lambda_l2=0.0011520776712645852,\n",
+       "                    learning_rate=0.02376367323636638, max_depth=5,\n",
+       "                    min_data_in_leaf=78, n_iter=200, num_leaves=207,\n",
+       "                    objective=&#x27;l2&#x27;, random_state=22, verbosity=-1)</pre></div></div></div></div></div></div><div class=\"sk-parallel-item\"><div class=\"sk-item\"><div class=\"sk-label-container\"><div class=\"sk-label sk-toggleable\"><label>lgb_2</label></div></div><div class=\"sk-serial\"><div class=\"sk-item\"><div class=\"sk-estimator sk-toggleable\"><input class=\"sk-toggleable__control sk-hidden--visually\" id=\"sk-estimator-id-4\" type=\"checkbox\" ><label for=\"sk-estimator-id-4\" class=\"sk-toggleable__label sk-toggleable__label-arrow\">CustomLGBMRegressor</label><div class=\"sk-toggleable__content\"><pre>CustomLGBMRegressor(bagging_fraction=0.5485770314992224, bagging_freq=7,\n",
+       "                    colsample_bynode=0.5110355095943208,\n",
+       "                    colsample_bytree=0.7759862336963801,\n",
+       "                    lambda_l1=0.005116829730239727,\n",
+       "                    lambda_l2=0.0011520776712645852,\n",
+       "                    learning_rate=0.02376367323636638, max_depth=5,\n",
+       "                    min_data_in_leaf=78, n_iter=200, num_leaves=207,\n",
+       "                    objective=&#x27;l2&#x27;, random_state=32, verbosity=-1)</pre></div></div></div></div></div></div><div class=\"sk-parallel-item\"><div class=\"sk-item\"><div class=\"sk-label-container\"><div class=\"sk-label sk-toggleable\"><label>lgb_3</label></div></div><div class=\"sk-serial\"><div class=\"sk-item\"><div class=\"sk-estimator sk-toggleable\"><input class=\"sk-toggleable__control sk-hidden--visually\" id=\"sk-estimator-id-5\" type=\"checkbox\" ><label for=\"sk-estimator-id-5\" class=\"sk-toggleable__label sk-toggleable__label-arrow\">CustomLGBMRegressor</label><div class=\"sk-toggleable__content\"><pre>CustomLGBMRegressor(bagging_fraction=0.5485770314992224, bagging_freq=7,\n",
+       "                    colsample_bynode=0.5110355095943208,\n",
+       "                    colsample_bytree=0.7759862336963801,\n",
+       "                    lambda_l1=0.005116829730239727,\n",
+       "                    lambda_l2=0.0011520776712645852,\n",
+       "                    learning_rate=0.02376367323636638, max_depth=5,\n",
+       "                    min_data_in_leaf=78, n_iter=200, num_leaves=207,\n",
+       "                    objective=&#x27;l2&#x27;, random_state=42, verbosity=-1)</pre></div></div></div></div></div></div><div class=\"sk-parallel-item\"><div class=\"sk-item\"><div class=\"sk-label-container\"><div class=\"sk-label sk-toggleable\"><label>lgb_4</label></div></div><div class=\"sk-serial\"><div class=\"sk-item\"><div class=\"sk-estimator sk-toggleable\"><input class=\"sk-toggleable__control sk-hidden--visually\" id=\"sk-estimator-id-6\" type=\"checkbox\" ><label for=\"sk-estimator-id-6\" class=\"sk-toggleable__label sk-toggleable__label-arrow\">CustomLGBMRegressor</label><div class=\"sk-toggleable__content\"><pre>CustomLGBMRegressor(bagging_fraction=0.5485770314992224, bagging_freq=7,\n",
+       "                    colsample_bynode=0.5110355095943208,\n",
+       "                    colsample_bytree=0.7759862336963801,\n",
+       "                    lambda_l1=0.005116829730239727,\n",
+       "                    lambda_l2=0.0011520776712645852,\n",
+       "                    learning_rate=0.02376367323636638, max_depth=5,\n",
+       "                    min_data_in_leaf=78, n_iter=200, num_leaves=207,\n",
+       "                    objective=&#x27;l2&#x27;, random_state=52, verbosity=-1)</pre></div></div></div></div></div></div><div class=\"sk-parallel-item\"><div class=\"sk-item\"><div class=\"sk-label-container\"><div class=\"sk-label sk-toggleable\"><label>lgb_5</label></div></div><div class=\"sk-serial\"><div class=\"sk-item\"><div class=\"sk-estimator sk-toggleable\"><input class=\"sk-toggleable__control sk-hidden--visually\" id=\"sk-estimator-id-7\" type=\"checkbox\" ><label for=\"sk-estimator-id-7\" class=\"sk-toggleable__label sk-toggleable__label-arrow\">CustomLGBMRegressor</label><div class=\"sk-toggleable__content\"><pre>CustomLGBMRegressor(bagging_fraction=0.5485770314992224, bagging_freq=7,\n",
+       "                    colsample_bynode=0.5110355095943208,\n",
+       "                    colsample_bytree=0.7759862336963801,\n",
+       "                    lambda_l1=0.005116829730239727,\n",
+       "                    lambda_l2=0.0011520776712645852,\n",
+       "                    learning_rate=0.02376367323636638, max_depth=5,\n",
+       "                    min_data_in_leaf=78, n_iter=200, num_leaves=207,\n",
+       "                    objective=&#x27;l2&#x27;, random_state=62, verbosity=-1)</pre></div></div></div></div></div></div><div class=\"sk-parallel-item\"><div class=\"sk-item\"><div class=\"sk-label-container\"><div class=\"sk-label sk-toggleable\"><label>lgb_6</label></div></div><div class=\"sk-serial\"><div class=\"sk-item\"><div class=\"sk-estimator sk-toggleable\"><input class=\"sk-toggleable__control sk-hidden--visually\" id=\"sk-estimator-id-8\" type=\"checkbox\" ><label for=\"sk-estimator-id-8\" class=\"sk-toggleable__label sk-toggleable__label-arrow\">CustomLGBMRegressor</label><div class=\"sk-toggleable__content\"><pre>CustomLGBMRegressor(bagging_fraction=0.5485770314992224, bagging_freq=7,\n",
+       "                    colsample_bynode=0.5110355095943208,\n",
+       "                    colsample_bytree=0.7759862336963801,\n",
+       "                    lambda_l1=0.005116829730239727,\n",
+       "                    lambda_l2=0.0011520776712645852,\n",
+       "                    learning_rate=0.02376367323636638, max_depth=5,\n",
+       "                    min_data_in_leaf=78, n_iter=200, num_leaves=207,\n",
+       "                    objective=&#x27;l2&#x27;, random_state=72, verbosity=-1)</pre></div></div></div></div></div></div><div class=\"sk-parallel-item\"><div class=\"sk-item\"><div class=\"sk-label-container\"><div class=\"sk-label sk-toggleable\"><label>lgb_7</label></div></div><div class=\"sk-serial\"><div class=\"sk-item\"><div class=\"sk-estimator sk-toggleable\"><input class=\"sk-toggleable__control sk-hidden--visually\" id=\"sk-estimator-id-9\" type=\"checkbox\" ><label for=\"sk-estimator-id-9\" class=\"sk-toggleable__label sk-toggleable__label-arrow\">CustomLGBMRegressor</label><div class=\"sk-toggleable__content\"><pre>CustomLGBMRegressor(bagging_fraction=0.5485770314992224, bagging_freq=7,\n",
+       "                    colsample_bynode=0.5110355095943208,\n",
+       "                    colsample_bytree=0.7759862336963801,\n",
+       "                    lambda_l1=0.005116829730239727,\n",
+       "                    lambda_l2=0.0011520776712645852,\n",
+       "                    learning_rate=0.02376367323636638, max_depth=5,\n",
+       "                    min_data_in_leaf=78, n_iter=200, num_leaves=207,\n",
+       "                    objective=&#x27;l2&#x27;, random_state=82, verbosity=-1)</pre></div></div></div></div></div></div><div class=\"sk-parallel-item\"><div class=\"sk-item\"><div class=\"sk-label-container\"><div class=\"sk-label sk-toggleable\"><label>lgb_8</label></div></div><div class=\"sk-serial\"><div class=\"sk-item\"><div class=\"sk-estimator sk-toggleable\"><input class=\"sk-toggleable__control sk-hidden--visually\" id=\"sk-estimator-id-10\" type=\"checkbox\" ><label for=\"sk-estimator-id-10\" class=\"sk-toggleable__label sk-toggleable__label-arrow\">CustomLGBMRegressor</label><div class=\"sk-toggleable__content\"><pre>CustomLGBMRegressor(bagging_fraction=0.5485770314992224, bagging_freq=7,\n",
+       "                    colsample_bynode=0.5110355095943208,\n",
+       "                    colsample_bytree=0.7759862336963801,\n",
+       "                    lambda_l1=0.005116829730239727,\n",
+       "                    lambda_l2=0.0011520776712645852,\n",
+       "                    learning_rate=0.02376367323636638, max_depth=5,\n",
+       "                    min_data_in_leaf=78, n_iter=200, num_leaves=207,\n",
+       "                    objective=&#x27;l2&#x27;, random_state=92, verbosity=-1)</pre></div></div></div></div></div></div><div class=\"sk-parallel-item\"><div class=\"sk-item\"><div class=\"sk-label-container\"><div class=\"sk-label sk-toggleable\"><label>lgb_9</label></div></div><div class=\"sk-serial\"><div class=\"sk-item\"><div class=\"sk-estimator sk-toggleable\"><input class=\"sk-toggleable__control sk-hidden--visually\" id=\"sk-estimator-id-11\" type=\"checkbox\" ><label for=\"sk-estimator-id-11\" class=\"sk-toggleable__label sk-toggleable__label-arrow\">CustomLGBMRegressor</label><div class=\"sk-toggleable__content\"><pre>CustomLGBMRegressor(bagging_fraction=0.5485770314992224, bagging_freq=7,\n",
+       "                    colsample_bynode=0.5110355095943208,\n",
+       "                    colsample_bytree=0.7759862336963801,\n",
+       "                    lambda_l1=0.005116829730239727,\n",
+       "                    lambda_l2=0.0011520776712645852,\n",
+       "                    learning_rate=0.02376367323636638, max_depth=5,\n",
+       "                    min_data_in_leaf=78, n_iter=200, num_leaves=207,\n",
+       "                    objective=&#x27;l2&#x27;, random_state=102, verbosity=-1)</pre></div></div></div></div></div></div></div></div></div></div>"
+      ],
+      "text/plain": [
+       "VotingRegressor(estimators=[('lgb_0',\n",
+       "                             CustomLGBMRegressor(bagging_fraction=0.5485770314992224,\n",
+       "                                                 bagging_freq=7,\n",
+       "                                                 colsample_bynode=0.5110355095943208,\n",
+       "                                                 colsample_bytree=0.7759862336963801,\n",
+       "                                                 lambda_l1=0.005116829730239727,\n",
+       "                                                 lambda_l2=0.0011520776712645852,\n",
+       "                                                 learning_rate=0.02376367323636638,\n",
+       "                                                 max_depth=5,\n",
+       "                                                 min_data_in_leaf=78,\n",
+       "                                                 n_iter=200, num_leaves=207,\n",
+       "                                                 objective='l2',...\n",
+       "                            ('lgb_9',\n",
+       "                             CustomLGBMRegressor(bagging_fraction=0.5485770314992224,\n",
+       "                                                 bagging_freq=7,\n",
+       "                                                 colsample_bynode=0.5110355095943208,\n",
+       "                                                 colsample_bytree=0.7759862336963801,\n",
+       "                                                 lambda_l1=0.005116829730239727,\n",
+       "                                                 lambda_l2=0.0011520776712645852,\n",
+       "                                                 learning_rate=0.02376367323636638,\n",
+       "                                                 max_depth=5,\n",
+       "                                                 min_data_in_leaf=78,\n",
+       "                                                 n_iter=200, num_leaves=207,\n",
+       "                                                 objective='l2',\n",
+       "                                                 random_state=102,\n",
+       "                                                 verbosity=-1))])"
+      ]
+     },
+     "execution_count": 24,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "X = df_train[feature_cols]\n",
+    "y = df_train[target_col]\n",
+    "\n",
+    "model.fit(X, y)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "c09c2fb1",
+   "metadata": {
+    "papermill": {
+     "duration": 0.025105,
+     "end_time": "2025-02-05T14:15:29.092691",
+     "exception": false,
+     "start_time": "2025-02-05T14:15:29.067586",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "### Prediction"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 25,
+   "id": "b1f356a4",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-02-05T14:15:29.144835Z",
+     "iopub.status.busy": "2025-02-05T14:15:29.144146Z",
+     "iopub.status.idle": "2025-02-05T14:15:29.247395Z",
+     "shell.execute_reply": "2025-02-05T14:15:29.246468Z"
+    },
+    "papermill": {
+     "duration": 0.131952,
+     "end_time": "2025-02-05T14:15:29.249843",
+     "exception": false,
+     "start_time": "2025-02-05T14:15:29.117891",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "df_subm[target_col] = model.predict(df_test[feature_cols])\n",
+    "df_subm[target_col] = df_subm[target_col].round()\n",
+    "\n",
+    "df_subm.to_csv('submission.csv')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "045ffb5b",
+   "metadata": {
+    "papermill": {
+     "duration": 0.024469,
+     "end_time": "2025-02-05T14:15:29.299493",
+     "exception": false,
+     "start_time": "2025-02-05T14:15:29.275024",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": []
+  }
+ ],
+ "metadata": {
+  "kaggle": {
+   "accelerator": "none",
+   "dataSources": [
+    {
+     "databundleVersionId": 9643020,
+     "sourceId": 81933,
+     "sourceType": "competition"
+    }
+   ],
+   "dockerImageVersionId": 30761,
+   "isGpuEnabled": false,
+   "isInternetEnabled": false,
+   "language": "python",
+   "sourceType": "notebook"
+  },
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.10.14"
+  },
+  "papermill": {
+   "default_parameters": {},
+   "duration": 113.365768,
+   "end_time": "2025-02-05T14:15:30.248225",
+   "environment_variables": {},
+   "exception": null,
+   "input_path": "__notebook__.ipynb",
+   "output_path": "__notebook__.ipynb",
+   "parameters": {},
+   "start_time": "2025-02-05T14:13:36.882457",
+   "version": "2.6.0"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
